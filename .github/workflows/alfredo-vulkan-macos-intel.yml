@@ -1,0 +1,107 @@
+name: Build Alfredo llama.cpp Vulkan (Intel Mac)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-vulkan:
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    steps:
+      - name: Installer les outils sur le runner distant
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake molten-vk vulkan-loader vulkan-headers shaderc glslang
+          echo "CMAKE_PREFIX_PATH=$(brew --prefix)" >> "$GITHUB_ENV"
+
+      - name: Recuperer la meme version de llama.cpp que le benchmark CPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --branch b11430 https://github.com/ggml-org/llama.cpp.git llama-src
+
+      - name: Compiler Vulkan sur le runner GitHub (pas sur le Mac utilisateur)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S llama-src -B build-vulkan \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_INSTALL_RPATH='@loader_path' \
+            -DGGML_METAL=OFF \
+            -DGGML_VULKAN=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_CURL=ON
+          cmake --build build-vulkan --config Release -j 4 \
+            --target llama-server llama-cli llama-bench
+
+      - name: Emballer les binaires et le runtime Vulkan
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p alfredo-vulkan/bin alfredo-vulkan/etc/vulkan/icd.d
+          # Copy compiled executable and all companion dynamic libraries.
+          for name in llama-server llama-cli llama-bench; do
+            cp "build-vulkan/bin/$name" alfredo-vulkan/bin/
+          done
+          find build-vulkan/bin -maxdepth 1 -name '*.dylib' -exec cp -L {} alfredo-vulkan/bin/ \;
+          VULKAN_LIB="$(brew --prefix vulkan-loader)/lib/libvulkan.1.dylib"
+          MOLTENVK_LIB="$(brew --prefix molten-vk)/lib/libMoltenVK.dylib"
+          test -f "$VULKAN_LIB"
+          test -f "$MOLTENVK_LIB"
+          cp -L "$VULKAN_LIB" alfredo-vulkan/bin/libvulkan.1.dylib
+          cp -L "$MOLTENVK_LIB" alfredo-vulkan/bin/libMoltenVK.dylib
+          cat > alfredo-vulkan/etc/vulkan/icd.d/MoltenVK_icd.json <<'JSON'
+          {
+            "file_format_version": "1.0.0",
+            "ICD": {
+              "library_path": "../../../bin/libMoltenVK.dylib",
+              "api_version": "1.3.0"
+            }
+          }
+          JSON
+          # The Homebrew-built ggml Vulkan dylib can link to a fixed prefix.
+          # Rewrite those references so the archive is relocatable.
+          python3 - <<'PY'
+          import glob, subprocess
+          files = glob.glob('alfredo-vulkan/bin/*')
+          for path in files:
+              result = subprocess.run(['otool', '-L', path], text=True, capture_output=True)
+              if result.returncode:
+                  continue
+              for line in result.stdout.splitlines()[1:]:
+                  linked = line.strip().split(' (', 1)[0]
+                  if 'libvulkan' in linked and '/libvulkan' in linked and not linked.startswith('@loader_path/'):
+                      subprocess.run(['install_name_tool', '-change', linked,
+                                      '@loader_path/libvulkan.1.dylib', path], check=True)
+          PY
+          # Re-sign binaries after changing their install names.
+          for file in alfredo-vulkan/bin/*; do
+            codesign --force --sign - "$file" >/dev/null 2>&1 || true
+          done
+          cat > alfredo-vulkan/bin/run-llama-server-vulkan <<'SH'
+          #!/bin/bash
+          set -euo pipefail
+          HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export DYLD_LIBRARY_PATH="$HERE${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+          export VK_ICD_FILENAMES="$HERE/../etc/vulkan/icd.d/MoltenVK_icd.json"
+          exec "$HERE/llama-server" "$@"
+          SH
+          chmod +x alfredo-vulkan/bin/run-llama-server-vulkan
+          echo "==== Executables ===="
+          file alfredo-vulkan/bin/llama-server
+          otool -L alfredo-vulkan/bin/libggml-vulkan.dylib || true
+          echo "==== Archive ===="
+          du -sh alfredo-vulkan
+
+      - name: Fournir l'archive precompilee
+        uses: actions/upload-artifact@v4
+        with:
+          name: alfredo-llama-vulkan-macos-intel-b11430
+          path: alfredo-vulkan/
+          retention-days: 7
