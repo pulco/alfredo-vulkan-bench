@@ -89,7 +89,7 @@ jobs:
               "const int64_t alf_load_end = ggml_time_us();",
               "prompt_cache->update();",
               "const int64_t alf_update_end = ggml_time_us();",
-              'SRV_INF("[ALF-CACHE] save_ms=%.2f load_ms=%.2f update_ms=%.2f total_ms=%.2f\n",',
+              'SRV_INF("[ALF-CACHE] save_ms=%.2f load_ms=%.2f update_ms=%.2f total_ms=%.2f\\n",',
               "    (alf_save_end-alf_save_start)/1000.0,",
               "    (alf_load_end-alf_load_start)/1000.0,",
               "    (alf_update_end-alf_load_end)/1000.0,",
