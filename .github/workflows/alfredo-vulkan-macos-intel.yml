@@ -22,7 +22,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth=1 --branch b11430 https://github.com/ggml-org/llama.cpp.git llama-src
+          git clone --depth=1 --branch b11734 https://github.com/ggml-org/llama.cpp.git llama-src
 
       - name: Compiler Vulkan sur le runner GitHub (pas sur le Mac utilisateur)
         shell: bash
@@ -102,6 +102,6 @@ jobs:
       - name: Fournir l'archive precompilee
         uses: actions/upload-artifact@v4
         with:
-          name: alfredo-llama-vulkan-macos-intel-b11430
+          name: alfredo-llama-vulkan-macos-intel-b11734
           path: alfredo-vulkan/
           retention-days: 7
