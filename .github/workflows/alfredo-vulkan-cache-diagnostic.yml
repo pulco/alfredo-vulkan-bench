@@ -1,0 +1,180 @@
+name: Diagnostic Alfredo Vulkan cache b11734
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-vulkan:
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    steps:
+      - name: Installer les outils sur le runner distant
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake molten-vk vulkan-loader vulkan-headers shaderc glslang
+          echo "CMAKE_PREFIX_PATH=$(brew --prefix)" >> "$GITHUB_ENV"
+
+      - name: Recuperer la meme version de llama.cpp que le benchmark CPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --branch b11734 https://github.com/ggml-org/llama.cpp.git llama-src
+
+      - name: Instrumenter les sauvegardes et transferts sans changer leur comportement
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("llama-src/ggml/src/ggml-vulkan/ggml-vulkan.cpp")
+          s = p.read_text()
+          # Add self-contained high-resolution timing and periodic totals.
+          include = '#include <chrono>\\n#include <cstdio>\\n#include <atomic>\\n'
+          if '#include <chrono>' not in s:
+              s = include.replace('\\n','\n') + s
+          for fn, call, tag in (
+              ("ggml_backend_vk_buffer_set_tensor", "ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);", "WRITE"),
+              ("ggml_backend_vk_buffer_get_tensor", "ggml_vk_buffer_read(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);", "READ"),
+          ):
+              pos = s.find("void " + fn + "(")
+              end = s.find("\n}", pos)
+              if pos < 0 or end < 0:
+                  raise SystemExit("Unexpected Vulkan source: " + fn)
+              block = s[pos:end]
+              if block.count(call) != 1:
+                  raise SystemExit("Unexpected Vulkan call: " + fn)
+              instrument = """{
+              const auto t0 = std::chrono::steady_clock::now();
+              ORIGINAL_CALL
+              const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+              static std::atomic<unsigned long long> count{0};
+              static std::atomic<unsigned long long> bytes{0};
+              static std::atomic<unsigned long long> micros{0};
+              const auto n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+              bytes.fetch_add(size, std::memory_order_relaxed);
+              micros.fetch_add((unsigned long long)(ms * 1000), std::memory_order_relaxed);
+              if (n % 32 == 0 || ms > 250.0) {
+                  std::fprintf(stderr, "[ALF-VK-TAG] calls=%llu bytes=%llu total_ms=%.2f last_ms=%.2f last_bytes=%zu\\n",
+                               n, bytes.load(), micros.load()/1000.0, ms, size);
+                  std::fflush(stderr);
+              }
+          }""".replace("ORIGINAL_CALL", call).replace("TAG", tag)
+              s = s[:pos] + block.replace(call, instrument) + s[end:]
+          p.write_text(s)
+          p = Path("llama-src/tools/server/server-context.cpp")
+          s = p.read_text()
+          old = """                ret->prompt_save(*prompt_cache);
+
+                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                    ret->prompt_clear();
+                }
+
+                prompt_cache->update();"""
+          new = """                const int64_t alf_save_start = ggml_time_us();
+                ret->prompt_save(*prompt_cache);
+                const int64_t alf_save_end = ggml_time_us();
+
+                const int64_t alf_load_start = ggml_time_us();
+                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                    ret->prompt_clear();
+                }
+                const int64_t alf_load_end = ggml_time_us();
+
+                prompt_cache->update();
+                const int64_t alf_update_end = ggml_time_us();
+                SRV_INF("[ALF-CACHE] save_ms=%.2f load_ms=%.2f update_ms=%.2f total_ms=%.2f\\n",
+                        (alf_save_end-alf_save_start)/1000.0,
+                        (alf_load_end-alf_load_start)/1000.0,
+                        (alf_update_end-alf_load_end)/1000.0,
+                        (alf_update_end-alf_save_start)/1000.0);"""
+          if s.count(old) != 1:
+              raise SystemExit("Unexpected prompt cache source")
+          p.write_text(s.replace(old,new))
+          print("Diagnostics installed without altering GPU transfer behavior")
+          PY
+
+      - name: Compiler Vulkan sur le runner GitHub (pas sur le Mac utilisateur)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S llama-src -B build-vulkan \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_INSTALL_RPATH='@loader_path' \
+            -DGGML_METAL=OFF \
+            -DGGML_VULKAN=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_CURL=ON
+          cmake --build build-vulkan --config Release -j 4 \
+            --target llama-server llama-cli llama-bench
+
+      - name: Emballer les binaires et le runtime Vulkan
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p alfredo-vulkan/bin alfredo-vulkan/etc/vulkan/icd.d
+          # Copy compiled executable and all companion dynamic libraries.
+          for name in llama-server llama-cli llama-bench; do
+            cp "build-vulkan/bin/$name" alfredo-vulkan/bin/
+          done
+          find build-vulkan/bin -maxdepth 1 -name '*.dylib' -exec cp -L {} alfredo-vulkan/bin/ \;
+          VULKAN_LIB="$(brew --prefix vulkan-loader)/lib/libvulkan.1.dylib"
+          MOLTENVK_LIB="$(brew --prefix molten-vk)/lib/libMoltenVK.dylib"
+          test -f "$VULKAN_LIB"
+          test -f "$MOLTENVK_LIB"
+          cp -L "$VULKAN_LIB" alfredo-vulkan/bin/libvulkan.1.dylib
+          cp -L "$MOLTENVK_LIB" alfredo-vulkan/bin/libMoltenVK.dylib
+          cat > alfredo-vulkan/etc/vulkan/icd.d/MoltenVK_icd.json <<'JSON'
+          {
+            "file_format_version": "1.0.0",
+            "ICD": {
+              "library_path": "../../../bin/libMoltenVK.dylib",
+              "api_version": "1.3.0"
+            }
+          }
+          JSON
+          # The Homebrew-built ggml Vulkan dylib can link to a fixed prefix.
+          # Rewrite those references so the archive is relocatable.
+          python3 - <<'PY'
+          import glob, subprocess
+          files = glob.glob('alfredo-vulkan/bin/*')
+          for path in files:
+              result = subprocess.run(['otool', '-L', path], text=True, capture_output=True)
+              if result.returncode:
+                  continue
+              for line in result.stdout.splitlines()[1:]:
+                  linked = line.strip().split(' (', 1)[0]
+                  if 'libvulkan' in linked and '/libvulkan' in linked and not linked.startswith('@loader_path/'):
+                      subprocess.run(['install_name_tool', '-change', linked,
+                                      '@loader_path/libvulkan.1.dylib', path], check=True)
+          PY
+          # Re-sign binaries after changing their install names.
+          for file in alfredo-vulkan/bin/*; do
+            codesign --force --sign - "$file" >/dev/null 2>&1 || true
+          done
+          cat > alfredo-vulkan/bin/run-llama-server-vulkan <<'SH'
+          #!/bin/bash
+          set -euo pipefail
+          HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export DYLD_LIBRARY_PATH="$HERE${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+          export VK_ICD_FILENAMES="$HERE/../etc/vulkan/icd.d/MoltenVK_icd.json"
+          exec "$HERE/llama-server" "$@"
+          SH
+          chmod +x alfredo-vulkan/bin/run-llama-server-vulkan
+          echo "==== Executables ===="
+          file alfredo-vulkan/bin/llama-server
+          otool -L alfredo-vulkan/bin/libggml-vulkan.dylib || true
+          echo "==== Archive ===="
+          du -sh alfredo-vulkan
+
+      - name: Fournir l'archive precompilee
+        uses: actions/upload-artifact@v4
+        with:
+          name: alfredo-llama-vulkan-macos-intel-b11734-diagnostic
+          path: alfredo-vulkan/
+          retention-days: 7
