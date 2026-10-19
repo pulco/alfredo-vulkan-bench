@@ -33,9 +33,8 @@ jobs:
           p = Path("llama-src/ggml/src/ggml-vulkan/ggml-vulkan.cpp")
           s = p.read_text()
           # Add self-contained high-resolution timing and periodic totals.
-          include = '#include <chrono>\\n#include <cstdio>\\n#include <atomic>\\n'
           if '#include <chrono>' not in s:
-              s = include.replace('\\n','\n') + s
+              s = '#include <chrono>\n#include <cstdio>\n#include <atomic>\n' + s
           for fn, call, tag in (
               ("ggml_backend_vk_buffer_set_tensor", "ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);", "WRITE"),
               ("ggml_backend_vk_buffer_get_tensor", "ggml_vk_buffer_read(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);", "READ"),
